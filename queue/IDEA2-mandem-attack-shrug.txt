@@ -1,0 +1,12 @@
+IDEA 2 - MACHINE/ANIMATOR: Mandem Attack shrug loop (no camera)
+
+Source: Wayla_Trend-Analysis_Oct2026.pdf section 2, IDEA 2.
+Channel: Wayla Science Lab (@waylasciencelab357). Shitpost/informal. NO Brainrot. NO Verity.
+
+Make ONE vertical video (9:16, ~8 seconds, perfect loop):
+- Attack on All Wayla character does Sasuke Mandem shoulder shrug, 3 frames, on each syllable of "ching dat mandem style".
+- White flash on drop, on-screen caption of the hook.
+- Sound: Mandem Style original via Use-This-Sound.
+
+Deliverable for this task: output plan + animator spec (the workflow builder writes output/<stem>-<ts>/plan.md).
+Post target: Oct 15-25 window. Title: attack on all wayla does mandem style #mandemstyle #sasuke #animeedit #shorts

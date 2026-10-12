@@ -1,0 +1,145 @@
+name: video-task-queue
+
+# Queue-gated runner: 08:00 and 15:00 UTC, but only does work when queue/*.txt exists.
+# One TXT per run (oldest first), then moves it out of queue/ and stops.
+# Manual runs allowed via workflow_dispatch for testing.
+on:
+  schedule:
+    - cron: "0 8,15 * * *"
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Optional: specific queue file to process (e.g. queue/IDEA2-mandem-attack-shrug.txt). Empty = oldest."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: video-task-queue
+  cancel-in-progress: false
+
+jobs:
+  process-one:
+    name: process-one-video-task
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check queue (exit quietly when empty)
+        id: queue
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "UTC now: $(date -u '+%Y-%m-%d %H:%M:%S')"
+          shopt -s nullglob
+          files=(queue/*.txt)
+          echo "queue_count=${#files[@]}"
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "has_task=false" >> "$GITHUB_OUTPUT"
+            echo "No queue/*.txt found. Nothing to do. Exiting successfully (no work, no failure)."
+            exit 0
+          fi
+          printf '%s\n' "${files[@]}" | sort
+          if [ -n "${{ inputs.task }}" ]; then
+            TASK="${{ inputs.task }}"
+          else
+            TASK="$(printf '%s\n' "${files[@]}" | sort | head -n 1)"
+          fi
+          if [ ! -f "$TASK" ]; then
+            echo "Requested task not found: $TASK"
+            exit 1
+          fi
+          echo "has_task=true" >> "$GITHUB_OUTPUT"
+          echo "task=$TASK" >> "$GITHUB_OUTPUT"
+          echo "Selected: $TASK"
+
+      - name: Stop if queue was empty
+        if: steps.queue.outputs.has_task != 'true'
+        shell: bash
+        run: echo "Queue empty at 08:00/15:00 window. Workflow ends here by design."
+
+      - name: Setup Python
+        if: steps.queue.outputs.has_task == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Node (for opencode via npm)
+        if: steps.queue.outputs.has_task == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install opencode (npm, auditable; no curl|bash)
+        if: steps.queue.outputs.has_task == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install -g "@opencode/cli"
+          opencode --version || opencode --help | head -n 20
+
+      - name: Prompt opencode to build one video task
+        if: steps.queue.outputs.has_task == 'true'
+        shell: bash
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          TASK="${{ steps.queue.outputs.task }}"
+          echo "Task: $TASK"
+          echo "--- task contents ---"
+          cat "$TASK"
+          echo "---------------------"
+          ls -la Wayla_Trend-Analysis_Oct2026.pdf Wayla-Science-Lab_Content-Audit.pdf || true
+          PROMPT="$(cat prompts/make_video.md)"
+          # Inject task path into prompt (opencode run takes a single prompt string).
+          FULL_PROMPT="$PROMPT
+          ---
+          TASK_FILE=$TASK
+          PDF_FILE=Wayla_Trend-Analysis_Oct2026.pdf
+          AUDIT_PDF=Wayla-Science-Lab_Content-Audit.pdf"
+          if [ -z "${OPENCODE_API_KEY:-}${ANTHROPIC_API_KEY:-}" ]; then
+            echo "No LLM key in secrets (OPENCODE_API_KEY/ANTHROPIC_API_KEY). Skipping 'opencode run', using deterministic builder only."
+            echo "To enable AI step, add one of those secrets in Settings > Secrets and variables > Actions."
+          else
+            echo "Running: opencode run (one task only, non-interactive)..."
+            # --standalone avoids the shared background service on ephemeral runners.
+            opencode --standalone run "$FULL_PROMPT" || {
+              echo "opencode run exited non-zero; continuing to deterministic builder so the queue still advances."
+            }
+          fi
+
+      - name: Build task artifact (deterministic, one video)
+        if: steps.queue.outputs.has_task == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TASK="${{ steps.queue.outputs.task }}"
+          python scripts/build_task.py --task "$TASK" --pdf Wayla_Trend-Analysis_Oct2026.pdf --out output
+          echo "Artifact built. New output:"
+          ls -R output | tail -n 30
+
+      - name: Move TXT out of queue (mark completed) and commit
+        if: steps.queue.outputs.has_task == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TASK="${{ steps.queue.outputs.task }}"
+          BASE="$(basename "$TASK")"
+          mkdir -p completed output
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git mv "$TASK" "completed/$BASE"
+          git add completed output || true
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+          else
+            git commit -m "video-task: complete $BASE (1 task, queue-gated run)"
+            git push
+          fi
+          echo "Moved $TASK -> completed/$BASE. Run stops after one task by design."
