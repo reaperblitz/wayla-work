@@ -1,2 +1,8 @@
 __pycache__/
 *.pyc
+# Rendered videos never live in git - they go to Actions Artifacts (2-day retention).
+*.mp4
+render/
+remotion/node_modules/
+remotion/props.json
+.remotion/

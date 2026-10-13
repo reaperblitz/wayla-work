@@ -1,38 +1,52 @@
-# Video task queue
+# Video task queue (Remotion MP4 edition)
 
 Schedule: **08:00 and 15:00 UTC daily** (`0 8,15 * * *`).
 Queue-gated: if `queue/*.txt` is empty at that time, the run exits successfully with no work.
-One TXT per run (oldest first), then the workflow moves it to `completed/` and stops.
+One TXT per run (oldest first). Each run renders **one 9:16 MP4 (1080x1920, 15s, h264)**
+with Remotion, uploads it to **Actions Artifacts with 2-day retention** (auto-deleted
+after ~2 days), posts a **Discord webhook** message, moves the TXT to `completed/`,
+and stops. **MP4s are never committed to the repo.**
+
+Weekly: `weekly-cleanup.yml` runs **Sundays 00:00 UTC** and deletes all
+`completed/*.txt` (keeps `.gitkeep`).
 
 ## Folders
 
-- `queue/` — put one `.txt` per AI-video task here. The runner consumes the oldest.
-- `completed/` — finished queue files land here (via `git mv` + push).
-- `output/<task>-<timestamp>/` — `plan.md`, `task.json`, `STATUS.txt` per completed task.
-- `prompts/make_video.md` — exact prompt given to `opencode run`.
-- `scripts/build_task.py` — deterministic builder (no network, no secrets).
+- `queue/` — one `.txt` per video task. Runner consumes the oldest.
+- `completed/` — finished queue files land here; purged weekly.
+- `render/` — local/CI render scratch (git-ignored, never committed).
+- `remotion/` — Remotion 9:16 project (`WaylaShort`, 1080x1920, 30fps, 450 frames).
+- `output/<task>-<timestamp>/` — tiny `plan.md` / `task.json` / `STATUS.txt` records only.
+- `prompts/make_video.md` — exact prompt for `opencode run` (writes `remotion/props.json`).
+- `scripts/make_props.py` — deterministic props fallback. `scripts/build_task.py` — record builder.
 
-## Secrets (optional but recommended)
+## Secrets (Settings > Secrets and variables > Actions)
 
-Settings > Secrets and variables > Actions > New repository secret:
+- `OPENCODE_API_KEY` **or** `ANTHROPIC_API_KEY` (optional) — enables the `opencode run` copy step.
+  Without either, the run still renders via the deterministic props builder.
+- `DISCORD_WEBHOOK_URL` (required for alerts) — Discord channel webhook. Each completed
+  video posts task name, MP4 size, artifact name (2-day expiry), and run link.
+  Without it, the run succeeds but skips the Discord step with a log notice.
 
-- `OPENCODE_API_KEY` **or** `ANTHROPIC_API_KEY` — lets the `opencode run` step call a model.
-- Without either key, the workflow skips `opencode run` and still builds the artifact + advances the queue.
-
-No other secrets needed. `GITHUB_TOKEN` (automatic) is used to push the queue move + output.
+`GITHUB_TOKEN` (automatic) pushes the queue move + records.
 
 ## Manual run
 
-Actions > video-task-queue > Run workflow. Optional input `task` picks a specific file,
-e.g. `queue/IDEA2-mandem-attack-shrug.txt`. Empty = oldest.
+Actions > video-task-queue > Run workflow. Optional `task` input picks a file,
+e.g. `queue/IDEA3-burning-bridges-dinner.txt`. Empty = oldest.
+Download MP4s from the run's **Artifacts** section within 2 days.
 
 ## GitHub TOS compliance
 
-- Twice-daily cron only, `timeout-minutes: 20`, single job, `concurrency` group so runs never overlap.
-- Least-privilege `permissions: contents: write` (needed to archive queue + save output).
-- Pinned marketplace actions by major version (`checkout@v4`, `setup-python@v5`, `setup-node@v4`).
-- opencode installed via `npm install -g @opencode/cli` (auditable registry install, no `curl | bash` in CI).
-- Non-interactive `opencode --standalone run` with a bounded prompt; failure never blocks queue progress.
-- No mining, no sleep loops, no runner persistence, no secret exfiltration, no spam commits (one commit per consumed task).
-- Note: GitHub may delay scheduled runs and auto-disable schedules after 60 days of repo inactivity — re-enable in Actions if needed.
-- Times are UTC (GitHub cron is always UTC). 08:00/15:00 local = convert to UTC cron if you need local time.
+- Twice-daily cron + weekly cleanup only; `timeout-minutes` set; single job;
+  `concurrency` groups prevent overlaps. No sleep loops, no runner persistence.
+- Least-privilege `permissions: contents: write` (queue move + records).
+- Pinned marketplace actions by major version (`checkout@v4`, `setup-python@v5`,
+  `setup-node@v4`, `upload-artifact@v4`).
+- opencode via `npm install -g @opencode/cli` (auditable); non-interactive
+  `opencode --standalone run` with bounded prompt; failures never block the queue.
+- Remotion via `npm ci` on a pinned `package-lock.json`; no `curl | bash` in CI.
+- No mining, no secret exfiltration (webhook URL only ever used as POST target),
+  one commit per consumed task, binaries excluded from git via `.gitignore`.
+- Scheduled workflows may be delayed and auto-disabled after 60 days of repo
+  inactivity — re-enable in Actions if needed. Cron times are UTC.

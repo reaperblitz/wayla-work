@@ -1,7 +1,8 @@
 name: video-task-queue
 
 # Queue-gated runner: 08:00 and 15:00 UTC, but only does work when queue/*.txt exists.
-# One TXT per run (oldest first), then moves it out of queue/ and stops.
+# One TXT per run (oldest first): Remotion renders ONE 9:16 MP4 -> Artifacts (2-day
+# retention, never committed) -> Discord webhook -> TXT moved to completed/ -> stop.
 # Manual runs allowed via workflow_dispatch for testing.
 on:
   schedule:
@@ -9,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       task:
-        description: "Optional: specific queue file to process (e.g. queue/IDEA2-mandem-attack-shrug.txt). Empty = oldest."
+        description: "Optional: specific queue file to process (e.g. queue/IDEA3-burning-bridges-dinner.txt). Empty = oldest."
         required: false
         default: ""
 
@@ -24,7 +25,7 @@ jobs:
   process-one:
     name: process-one-video-task
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -55,6 +56,7 @@ jobs:
           fi
           echo "has_task=true" >> "$GITHUB_OUTPUT"
           echo "task=$TASK" >> "$GITHUB_OUTPUT"
+          echo "stem=$(basename "$TASK" .txt)" >> "$GITHUB_OUTPUT"
           echo "Selected: $TASK"
 
       - name: Stop if queue was empty
@@ -68,11 +70,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Setup Node (for opencode via npm)
+      - name: Setup Node (opencode + Remotion)
         if: steps.queue.outputs.has_task == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: npm
+          cache-dependency-path: remotion/package-lock.json
 
       - name: Install opencode (npm, auditable; no curl|bash)
         if: steps.queue.outputs.has_task == 'true'
@@ -82,7 +86,7 @@ jobs:
           npm install -g "@opencode/cli"
           opencode --version || opencode --help | head -n 20
 
-      - name: Prompt opencode to build one video task
+      - name: Prompt opencode (reads PDF + task, writes render props)
         if: steps.queue.outputs.has_task == 'true'
         shell: bash
         env:
@@ -91,40 +95,108 @@ jobs:
         run: |
           set -euo pipefail
           TASK="${{ steps.queue.outputs.task }}"
-          echo "Task: $TASK"
-          echo "--- task contents ---"
           cat "$TASK"
-          echo "---------------------"
-          ls -la Wayla_Trend-Analysis_Oct2026.pdf Wayla-Science-Lab_Content-Audit.pdf || true
+          ls -la Wayla_Trend-Analysis_Oct2026.pdf || true
           PROMPT="$(cat prompts/make_video.md)"
-          # Inject task path into prompt (opencode run takes a single prompt string).
           FULL_PROMPT="$PROMPT
           ---
           TASK_FILE=$TASK
           PDF_FILE=Wayla_Trend-Analysis_Oct2026.pdf
-          AUDIT_PDF=Wayla-Science-Lab_Content-Audit.pdf"
+          PROPS_FILE=remotion/props.json"
           if [ -z "${OPENCODE_API_KEY:-}${ANTHROPIC_API_KEY:-}" ]; then
-            echo "No LLM key in secrets (OPENCODE_API_KEY/ANTHROPIC_API_KEY). Skipping 'opencode run', using deterministic builder only."
-            echo "To enable AI step, add one of those secrets in Settings > Secrets and variables > Actions."
+            echo "No LLM key in secrets. Skipping 'opencode run'; deterministic props builder covers it."
           else
-            echo "Running: opencode run (one task only, non-interactive)..."
-            # --standalone avoids the shared background service on ephemeral runners.
             opencode --standalone run "$FULL_PROMPT" || {
-              echo "opencode run exited non-zero; continuing to deterministic builder so the queue still advances."
+              echo "opencode run non-zero; continuing to deterministic builder."
             }
           fi
 
-      - name: Build task artifact (deterministic, one video)
+      - name: Build render props (deterministic fallback)
         if: steps.queue.outputs.has_task == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          TASK="${{ steps.queue.outputs.task }}"
-          python scripts/build_task.py --task "$TASK" --pdf Wayla_Trend-Analysis_Oct2026.pdf --out output
-          echo "Artifact built. New output:"
-          ls -R output | tail -n 30
+          python scripts/make_props.py --task "${{ steps.queue.outputs.task }}" --props remotion/props.json
+          cat remotion/props.json
 
-      - name: Move TXT out of queue (mark completed) and commit
+      - name: Install Remotion deps
+        if: steps.queue.outputs.has_task == 'true'
+        shell: bash
+        working-directory: remotion
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          npx tsc --noEmit -p tsconfig.json
+
+      - name: Render 9:16 Short with Remotion (1080x1920, 15s)
+        if: steps.queue.outputs.has_task == 'true'
+        shell: bash
+        working-directory: remotion
+        run: |
+          set -euo pipefail
+          mkdir -p ../render
+          OUT="../render/${{ steps.queue.outputs.stem }}.mp4"
+          rm -f "$OUT"
+          npx remotion render WaylaShort "$OUT" --props=./props.json
+          ls -la "$OUT"
+          echo "OUT_MP4=$OUT"
+
+      - name: Verify MP4 (9:16, h264)
+        if: steps.queue.outputs.has_task == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          MP4="render/${{ steps.queue.outputs.stem }}.mp4"
+          ffprobe -v error -select_streams v:0 \
+            -show_entries stream=width,height,duration,codec_name \
+            -of default=noprint_wrappers=1 "$MP4"
+          test "$(stat -c%s "$MP4")" -gt 100000
+
+      - name: Upload MP4 to Artifacts (2-day retention, not in repo)
+        if: steps.queue.outputs.has_task == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: wayla-short-${{ steps.queue.outputs.stem }}
+          path: render/${{ steps.queue.outputs.stem }}.mp4
+          retention-days: 2
+          if-no-files-found: error
+
+      - name: Build task record (tiny files only, no MP4)
+        if: steps.queue.outputs.has_task == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/build_task.py --task "${{ steps.queue.outputs.task }}" --pdf Wayla_Trend-Analysis_Oct2026.pdf --out output
+
+      - name: Notify Discord webhook
+        if: steps.queue.outputs.has_task == 'true'
+        shell: bash
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          STEM="${{ steps.queue.outputs.stem }}"
+          MP4="render/${STEM}.mp4"
+          SIZE="$(stat -c%s "$MP4")"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if [ -z "${DISCORD_WEBHOOK_URL:-}" ]; then
+            echo "DISCORD_WEBHOOK_URL not set; skipping Discord notify (add it in repo Secrets)."
+            exit 0
+          fi
+          MSG="Wayla short completed: ${STEM} (${SIZE} bytes, 1080x1920). Artifact: wayla-short-${STEM} (expires in 2 days). Run: ${RUN_URL}"
+          python - "$DISCORD_WEBHOOK_URL" "$MSG" <<'EOF'
+          import json, sys, urllib.request
+          url, msg = sys.argv[1], sys.argv[2]
+          req = urllib.request.Request(
+              url,
+              data=json.dumps({"content": msg[:1900]}).encode(),
+              headers={"Content-Type": "application/json"},
+          )
+          urllib.request.urlopen(req, timeout=30).read()
+          print("discord notified")
+          EOF
+
+      - name: Move TXT out of queue (mark completed) and commit records only
         if: steps.queue.outputs.has_task == 'true'
         shell: bash
         run: |
@@ -132,14 +204,18 @@ jobs:
           TASK="${{ steps.queue.outputs.task }}"
           BASE="$(basename "$TASK")"
           mkdir -p completed output
+          rm -f "render/${{ steps.queue.outputs.stem }}.mp4"
+          rm -f remotion/props.json
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git mv "$TASK" "completed/$BASE"
-          git add completed output || true
+          # Records only: MP4s are git-ignored and never committed (Artifacts hold them for 2 days).
+          git add completed output
+          git reset -q -- render 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "Nothing to commit."
           else
-            git commit -m "video-task: complete $BASE (1 task, queue-gated run)"
+            git commit -m "video-task: complete $BASE with Remotion MP4 to Artifacts (2-day)"
             git push
           fi
           echo "Moved $TASK -> completed/$BASE. Run stops after one task by design."

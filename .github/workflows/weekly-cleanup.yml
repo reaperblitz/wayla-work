@@ -1,0 +1,50 @@
+name: weekly-completed-cleanup
+
+# Every week, empty the completed/ folder (keeps .gitkeep).
+# Manual runs allowed via workflow_dispatch.
+on:
+  schedule:
+    - cron: "0 0 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: weekly-completed-cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    name: purge-completed-folder
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Remove all completed task files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p completed
+          shopt -s nullglob
+          files=(completed/*.txt)
+          echo "completed_count=${#files[@]}"
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "completed/ already empty. Nothing to do."
+            exit 0
+          fi
+          printf '%s\n' "${files[@]}"
+          rm -f completed/*.txt
+          touch completed/.gitkeep
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add completed
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+          else
+            git commit -m "chore: weekly purge of completed/ task files"
+            git push
+          fi
+          echo "completed/ purged for the week."
